@@ -1,9 +1,9 @@
 <!DOCTYPE html>
 <html lang="pt-BR">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Volume e promessas: transportadoras</title>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Volume e promessas: transportadoras</title>
 <style>
     :root {
       --bg: #efe7da; --ink: #1c1915; --muted: #5e564c; --card: #fbf7f0; --line: #ddd2c2;
@@ -65,16 +65,317 @@
   </style>
 </head>
 <body>
-  <main id="app"><p>Carregando o painel…</p></main>
-  <script src="p1.js"></script>
-  <script src="p2.js"></script>
-  <script src="p3.js"></script>
-  <script src="p4.js"></script>
-  <script src="p5.js"></script>
-  <script src="p6.js"></script>
-  <script src="p7.js"></script>
-  <script src="p8.js"></script>
-  <script>window.VOLUME = JSON.parse(window.VOLUME_PARTS.join(""));</script>
-  <script src="volume_render.js"></script>
+<main id="app"><p>Carregando o painel...</p></main>
+<script src="data.js"></script>
+<script>
+(function(){var r=window.VOLUME_COMPACT;r.carriers.forEach(function(c){var out={};Object.keys(c.daily_by_month).forEach(function(m){var ca=0,cf=0;out[m]=c.daily_by_month[m].map(function(p){var d=m+"-"+String(p[0]).padStart(2,"0"),a=p[1],f=p[2];if(a!=null)ca+=a;if(f!=null)cf+=f;return {day:d,actual:a,forecast:f,cum_actual:a!=null?ca:null,cum_forecast:f!=null?cf:null};});});c.daily_by_month=out;});window.VOLUME=r;})();
+</script>
+<script>
+/* Renders volume.html from the payload in volume.js (window.VOLUME).
+   Charts are inline SVG so the page has no external dependencies. */
+(function () {
+  const MONTHS = ["jan", "fev", "mar", "abr", "mai", "jun", "jul", "ago", "set", "out", "nov", "dez"];
+  const COLORS = { COR: "#2a5d8f", LOG: "#1d6a45", JAD: "#8a6230", JTE: "#9c3424", OPT: "#5b4b8a", IMI: "#3b8a8f", TEX: "#c08a3e", PEG: "#6b6b6b" };
+  const STALE_DAYS = 3;
+  const MONTHS_IN_CARD = 6;
+  const MIN_SLOT_FOR_LABEL = 34; // SVG units per bar needed to print a value above every bar
+
+  const num = (value, digits = 0) => value == null ? "–" : Number(value).toLocaleString("pt-BR", { maximumFractionDigits: digits });
+  const brl = (value) => value == null ? "–" : Number(value).toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
+  const pct = (ratio) => ratio == null ? "–" : `${(ratio * 100).toLocaleString("pt-BR", { maximumFractionDigits: 0 })}%`;
+  const delta = (ratio) => ratio == null ? "–" : `${ratio > 0 ? "+" : ""}${(ratio * 100).toLocaleString("pt-BR", { maximumFractionDigits: 0 })}%`;
+  const short = (value) => value >= 1e6 ? `${num(value / 1e6, 1)} mi` : value >= 1000 ? `${num(value / 1000, value < 10000 ? 1 : 0)} mil` : num(value);
+  const dayMonth = (iso) => iso ? `${iso.slice(8, 10)}/${iso.slice(5, 7)}` : "–";
+  const monthLabel = (ym) => `${MONTHS[Number(ym.slice(5, 7)) - 1]}/${ym.slice(0, 4)}`;
+  const sum = (list, pick) => list.reduce((total, item) => total + (pick(item) || 0), 0);
+  const ratio = (part, whole) => part != null && whole ? part / whole : null;
+  const tone = (value, good = 1, warn = 0.9) => value == null ? "neutral" : value >= good ? "ok" : value >= warn ? "warn" : "bad";
+  const cell = (value) => value == null ? "" : value >= 1 ? "good" : value >= 0.9 ? "warn" : "bad";
+
+  const monthOf = (carrier, month) => carrier.monthly.find((entry) => entry.month === month) || null;
+  const isPartial = (entry) => Boolean(entry && entry.in_progress);
+  const expected = (entry) => entry ? (isPartial(entry) ? entry.projection : entry.actual) : null;
+  const previousMonth = (ym) => {
+    const [year, month] = ym.split("-").map(Number);
+    return month === 1 ? `${year - 1}-12` : `${year}-${String(month - 1).padStart(2, "0")}`;
+  };
+
+  function daysBetween(a, b) {
+    return Math.round((new Date(b) - new Date(a)) / 86400000);
+  }
+
+  /* ---------- SVG helpers ---------- */
+  const PAD = { l: 48, r: 12, t: 14, b: 26 };
+
+  function scales(count, max, width, height) {
+    const inner = width - PAD.l - PAD.r;
+    return {
+      slot: inner / Math.max(count, 1),
+      x: (index) => PAD.l + (count > 1 ? (index / (count - 1)) * inner : inner / 2),
+      y: (value) => height - PAD.b - (value / max) * (height - PAD.t - PAD.b),
+    };
+  }
+
+  function grid(scale, max, width) {
+    return [0, 0.25, 0.5, 0.75, 1].map((fraction) => {
+      const y = scale.y(fraction * max).toFixed(1);
+      return `<line x1="${PAD.l}" x2="${width - PAD.r}" y1="${y}" y2="${y}" stroke="#e6ddcf"/><text x="${PAD.l - 6}" y="${Number(y) + 3}" text-anchor="end">${short(fraction * max)}</text>`;
+    }).join("");
+  }
+
+  function path(values, xAt, yAt) {
+    let d = "", pen = false;
+    values.forEach((value, index) => {
+      if (value == null) { pen = false; return; }
+      d += `${pen ? "L" : "M"}${xAt(index).toFixed(1)} ${yAt(value).toFixed(1)} `;
+      pen = true;
+    });
+    return d;
+  }
+
+  function xLabels(labels, xAt, height, every) {
+    return labels.map((label, index) => index % every === 0 || index === labels.length - 1
+      ? `<text x="${xAt(index).toFixed(1)}" y="${height - 8}" text-anchor="middle">${label}</text>` : "").join("");
+  }
+
+  function lineChart({ labels, series, hlines = [], width = 600, height = 220 }) {
+    const values = [...series.flatMap((s) => s.values), ...hlines.map((h) => h.value)].filter((v) => v != null);
+    if (!values.length) return `<p class="note">Sem dados para o período.</p>`;
+    const max = Math.max(...values) * 1.05;
+    const scale = scales(labels.length, max, width, height);
+    const lines = series.map((s) => `<path d="${path(s.values, scale.x, scale.y)}" fill="none" stroke="${s.color}" stroke-width="2.2" ${s.dash ? 'stroke-dasharray="6 4"' : ""} stroke-linejoin="round"/>`).join("");
+    const refs = hlines.map((h) => `<line x1="${PAD.l}" x2="${width - PAD.r}" y1="${scale.y(h.value).toFixed(1)}" y2="${scale.y(h.value).toFixed(1)}" stroke="${h.color}" stroke-width="1.6" stroke-dasharray="3 4"/><text x="${width - PAD.r}" y="${(scale.y(h.value) - 4).toFixed(1)}" text-anchor="end" fill="${h.color}">${h.label}</text>`).join("");
+    return `<svg class="chart" viewBox="0 0 ${width} ${height}" role="img">${grid(scale, max, width)}${refs}${lines}${xLabels(labels, scale.x, height, Math.ceil(labels.length / 10))}</svg>`;
+  }
+
+  function barChart({ labels, bars, partial = [], lines = [], color, width = 600, height = 220 }) {
+    const values = [...bars, ...lines.flatMap((l) => l.values)].filter((v) => v != null);
+    if (!values.length) return `<p class="note">Sem dados para o período.</p>`;
+    const max = Math.max(...values) * 1.12;
+    const scale = scales(labels.length, max, width, height);
+    const center = (index) => PAD.l + scale.slot * (index + 0.5);
+    const barWidth = scale.slot * 0.62;
+    const labelEvery = scale.slot < MIN_SLOT_FOR_LABEL ? 2 : 1;
+    const rects = bars.map((value, index) => value == null ? "" : `
+      <rect x="${(center(index) - barWidth / 2).toFixed(1)}" y="${scale.y(value).toFixed(1)}" width="${barWidth.toFixed(1)}" height="${(scale.y(0) - scale.y(value)).toFixed(1)}" rx="3" fill="${color}" opacity="${partial[index] ? 0.35 : 0.9}"><title>${labels[index]}: ${num(value)}</title></rect>
+      ${(bars.length - 1 - index) % labelEvery === 0 ? `<text x="${center(index).toFixed(1)}" y="${(scale.y(value) - 3).toFixed(1)}" text-anchor="middle" font-size="8.5">${short(value)}</text>` : ""}`).join("");
+    const steps = lines.map((l) => `<path d="${path(l.values, center, scale.y)}" fill="none" stroke="${l.color}" stroke-width="2" ${l.dash ? 'stroke-dasharray="6 4"' : ""}/>`).join("");
+    return `<svg class="chart" viewBox="0 0 ${width} ${height}" role="img">${grid(scale, max, width)}${rects}${steps}${xLabels(labels, center, height, Math.ceil(labels.length / 11))}</svg>`;
+  }
+
+  function stackedChart({ months, carriers, width = 1180, height = 280 }) {
+    const totals = months.map((month) => sum(carriers, (c) => (monthOf(c, month) || {}).actual));
+    const max = Math.max(...totals, 1) * 1.1;
+    const scale = scales(months.length, max, width, height);
+    const barWidth = scale.slot * 0.66;
+    const columns = months.map((month, index) => {
+      let top = 0;
+      const x = (PAD.l + scale.slot * (index + 0.5) - barWidth / 2).toFixed(1);
+      const parts = carriers.map((carrier) => {
+        const entry = monthOf(carrier, month);
+        if (!entry || !entry.actual) return "";
+        top += entry.actual;
+        return `<rect x="${x}" y="${scale.y(top).toFixed(1)}" width="${barWidth.toFixed(1)}" height="${(scale.y(0) - scale.y(entry.actual)).toFixed(1)}" fill="${COLORS[carrier.code]}" opacity="${isPartial(entry) ? 0.55 : 0.92}"><title>${carrier.name} · ${monthLabel(month)}: ${num(entry.actual)}</title></rect>`;
+      }).join("");
+      return `${parts}<text x="${(Number(x) + barWidth / 2).toFixed(1)}" y="${(scale.y(top) - 4).toFixed(1)}" text-anchor="middle" font-weight="600">${short(top)}</text>`;
+    }).join("");
+    const labels = months.map((month, index) => `<text x="${(PAD.l + scale.slot * (index + 0.5)).toFixed(1)}" y="${height - 8}" text-anchor="middle">${monthLabel(month)}</text>`).join("");
+    return `<svg class="chart" viewBox="0 0 ${width} ${height}" role="img">${grid(scale, max, width)}${columns}${labels}</svg>`;
+  }
+
+  /* ---------- sections ---------- */
+  function header(report, month) {
+    const options = [...report.months].reverse().map((m) => `<option value="${m}" ${m === month ? "selected" : ""}>${monthLabel(m)}</option>`).join("");
+    return `<header>
+      <p class="kicker">${report.kicker || `Planilha · ${report.source_file}`}</p>
+      <h1>${report.title}</h1>
+      <p class="sub">${report.subtitle || `Etiquetas pagas por dia, de ${report.period.label}, comparadas com a previsão diária, a promessa mensal e as metas semanais de cada transportadora. Pegaki é rede de postagem e não entra nos totais.`}</p>
+      
+      <div class="toolbar"><label for="month">Mês em foco</label><select id="month">${options}</select></div>
+    </header>`;
+  }
+
+  function totals(report, month) {
+    const main = report.carriers.filter((c) => c.counts_in_total);
+    const entries = main.map((c) => ({ carrier: c, entry: monthOf(c, month) })).filter((item) => item.entry && item.entry.actual != null);
+    const actual = sum(entries, (item) => item.entry.actual);
+    const withForecast = entries.filter((item) => item.entry.forecast_to_date);
+    const forecastRatio = ratio(sum(withForecast, (item) => item.entry.actual), sum(withForecast, (item) => item.entry.forecast_to_date));
+    const cost = sum(entries, (item) => item.entry.cost);
+    const projected = sum(entries, (item) => expected(item.entry));
+    const previous = sum(main, (c) => (monthOf(c, previousMonth(month)) || {}).actual);
+    const latest = entries.map((item) => item.entry.last_reported_day).sort().pop();
+    const lagging = entries.filter((item) => isPartial(item.entry) && daysBetween(item.entry.last_reported_day, latest) >= STALE_DAYS)
+      .map((item) => `${item.carrier.name} até ${dayMonth(item.entry.last_reported_day)}`);
+    const partial = entries.some((item) => isPartial(item.entry));
+    return `<section class="totals">
+      <article class="stat"><span class="label">Etiquetas pagas em ${monthLabel(month)}</span><strong>${num(actual)}</strong><em>${partial ? `Parcial, até ${dayMonth(latest)}` : "Mês fechado"}${lagging.length ? ` · ${lagging.join("; ")}` : ""}</em></article>
+      <article class="stat"><span class="label">Realizado vs previsto até a data</span><strong>${pct(forecastRatio)}</strong><em>${withForecast.length} de ${main.length} transportadoras com previsão no mês</em></article>
+      <article class="stat"><span class="label">Custo real das transportadoras</span><strong>${brl(cost)}</strong><em>${brl(ratio(cost, actual))} por etiqueta</em></article>
+      <article class="stat"><span class="label">${partial ? "Projeção do mês" : "Fechamento do mês"} vs mês anterior</span><strong>${delta(previous ? projected / previous - 1 : null)}</strong><em>${num(projected)} contra ${num(previous)} em ${monthLabel(previousMonth(month))}</em></article>
+    </section>`;
+  }
+
+  function comparison(report, month) {
+    const rows = report.carriers
+      .map((carrier) => ({ carrier, entry: monthOf(carrier, month), previous: monthOf(carrier, previousMonth(month)) }))
+      .filter((item) => item.entry)
+      .sort((a, b) => (b.carrier.counts_in_total - a.carrier.counts_in_total) || ((b.entry.actual || 0) - (a.entry.actual || 0)));
+    const line = ({ carrier, entry, previous }) => {
+      const change = previous && previous.actual ? expected(entry) / previous.actual - 1 : null;
+      return `<tr>
+        <td class="name">${carrier.name}${carrier.counts_in_total ? "" : " <span class='label'>rede de postagem</span>"}</td>
+        <td>${num(entry.actual)}</td><td>${entry.days_reported}/${entry.days_in_month}</td>
+        <td>${num(entry.forecast_to_date)}</td><td class="${cell(entry.attainment_forecast)}">${pct(entry.attainment_forecast)}</td>
+        <td>${num(entry.promise)}</td><td class="${cell(entry.attainment_promise)}">${pct(entry.attainment_promise)}</td>
+        <td>${isPartial(entry) ? num(entry.projection) : "fechado"}</td>
+        <td>${num(previous && previous.actual)}</td><td class="${change == null ? "" : change >= 0 ? "good" : "bad"}">${delta(change)}</td>
+        <td>${brl(entry.cost || null)}</td><td>${brl(entry.cost_per_label)}</td>
+      </tr>`;
+    };
+    return `<section class="panel"><h2>Comparativo de ${monthLabel(month)}</h2>
+      <p class="note">Ordenado por etiquetas pagas. "Previsto até a data" soma a previsão apenas dos dias já reportados; a projeção é o ritmo diário atual aplicado ao mês inteiro. A variação compara a projeção (ou o fechamento) com o mês anterior.</p>
+      <div class="wrap"><table>
+        <thead><tr><th>Transportadora</th><th>Etiquetas pagas</th><th>Dias</th><th>Previsto até a data</th><th>% prev.</th><th>Promessa</th><th>% prom.</th><th>Projeção</th><th>Mês anterior</th><th>Variação</th><th>Custo real</th><th>Custo/etiq.</th></tr></thead>
+        <tbody>${rows.map(line).join("")}</tbody>
+      </table></div></section>`;
+  }
+
+  /* Months inside a carrier's history with no volume at all (a hole in the sheet, not a real zero). */
+  function gaps(report, carrier) {
+    const reported = report.months.filter((month) => (monthOf(carrier, month) || {}).actual != null);
+    if (reported.length < 2) return [];
+    const missing = report.months.filter((month) => month > reported[0] && month < reported[reported.length - 1] && !reported.includes(month));
+    if (!missing.length) return [];
+    const first = missing[0], last = missing[missing.length - 1];
+    return [`${carrier.name} sem volume registrado ${first === last ? `em ${monthLabel(first)}` : `de ${monthLabel(first)} a ${monthLabel(last)}`}`];
+  }
+
+  function evolution(report) {
+    const carriers = report.carriers.filter((c) => c.counts_in_total);
+    const holes = carriers.flatMap((carrier) => gaps(report, carrier));
+    return `<section class="panel"><h2>Evolução mensal das etiquetas pagas</h2>
+      <p class="note">Soma das transportadoras (sem Pegaki). Meses parciais aparecem mais claros.${holes.length ? ` ${holes.join("; ")}: a queda nesses meses é falta de dado, não de volume.` : ""}</p>
+      ${stackedChart({ months: report.months, carriers })}
+      <div class="legend">${carriers.map((c) => `<span><b style="background:${COLORS[c.code]}"></b>${c.name}</span>`).join("")}</div>
+    </section>`;
+  }
+
+  function cumulativeChart(carrier, entry) {
+    const points = carrier.daily_by_month[entry.month] || [];
+    const hlines = entry.promise ? [{ value: entry.promise, color: "var(--amber)", label: `Promessa ${short(entry.promise)}` }] : [];
+    return lineChart({
+      labels: points.map((p) => p.day.slice(8, 10)),
+      series: [
+        { values: points.map((p) => p.cum_forecast), color: "var(--blue)", dash: true },
+        { values: points.map((p) => p.cum_actual), color: COLORS[carrier.code] },
+      ],
+      hlines,
+    });
+  }
+
+  function weeklyChart(carrier) {
+    const weeks = carrier.weekly;
+    return barChart({
+      labels: weeks.map((w) => w.label.replace(/\s*\(.*\)/, "")),
+      bars: weeks.map((w) => w.actual),
+      partial: weeks.map((w) => w.days_reported < 7),
+      lines: [
+        { values: weeks.map((w) => w.target), color: "var(--amber)" },
+        { values: weeks.map((w) => w.next_target), color: "var(--red)", dash: true },
+      ],
+      color: COLORS[carrier.code],
+    });
+  }
+
+  function monthTable(carrier, month) {
+    const index = carrier.monthly.findIndex((entry) => entry.month === month);
+    const recent = carrier.monthly.slice(Math.max(0, index - MONTHS_IN_CARD + 1), index + 1).reverse();
+    return `<table><thead><tr><th>Mês</th><th>Etiquetas</th><th>Previsto</th><th>Promessa</th><th>Custo/etiq.</th><th>Var. m/m</th></tr></thead><tbody>${recent.map((entry) => {
+      const previous = monthOf(carrier, previousMonth(entry.month));
+      const change = previous && previous.actual && entry.actual != null ? expected(entry) / previous.actual - 1 : null;
+      return `<tr><td>${monthLabel(entry.month)}${isPartial(entry) ? ` <span class="label">parcial · ${entry.days_reported} dias</span>` : ""}</td><td>${num(entry.actual)}</td><td>${num(entry.forecast)}</td><td>${num(entry.promise)}</td><td>${brl(entry.cost_per_label)}</td><td class="${change == null ? "" : change >= 0 ? "good" : "bad"}">${delta(change)}</td></tr>`;
+    }).join("")}</tbody></table>`;
+  }
+
+  function card(carrier, month) {
+    const entry = monthOf(carrier, month);
+    if (!entry || entry.actual == null) {
+      return `<article class="panel carrier"><p class="kicker">${carrier.role}</p><h2>${carrier.name}</h2><p class="note">Sem volume reportado em ${monthLabel(month)}.</p></article>`;
+    }
+    const projection = expected(entry);
+    const projectionNote = entry.promise ? `${pct(ratio(projection, entry.promise))} da promessa` : isPartial(entry) ? "ritmo diário atual" : "mês fechado";
+    return `<article class="panel carrier">
+      <p class="kicker">${carrier.role}</p>
+      <h2>${carrier.name}</h2>
+      ${carrier.note ? `<p class="note">${carrier.note}</p>` : ""}
+      <div class="funnel">
+        <div class="pill total"><span class="label">Etiquetas pagas</span><span class="big">${num(entry.actual)}</span>${isPartial(entry) ? `até ${dayMonth(entry.last_reported_day)} · ${entry.days_reported} dias` : "mês fechado"}</div>
+        <div class="pill ${tone(entry.attainment_forecast)}"><span class="label">Previsto até a data</span><span class="big">${num(entry.forecast_to_date)}</span>${entry.forecast_to_date ? `${pct(entry.attainment_forecast)} realizado` : "sem previsão"}</div>
+        <div class="pill ${tone(entry.attainment_promise)}"><span class="label">Promessa do mês</span><span class="big">${num(entry.promise)}</span>${entry.promise ? `${pct(entry.attainment_promise)} realizado` : "sem promessa"}</div>
+        <div class="pill ${entry.promise ? tone(ratio(projection, entry.promise)) : "neutral"}"><span class="label">${isPartial(entry) ? "Projeção" : "Fechamento"}</span><span class="big">${num(projection)}</span>${projectionNote}</div>
+      </div>
+      <h3>Acumulado em ${monthLabel(month)}</h3>
+      ${cumulativeChart(carrier, entry)}
+      <div class="legend"><span><b style="background:${COLORS[carrier.code]}"></b>Realizado acumulado</span><span style="color:var(--blue)"><i></i>Previsto acumulado</span>${entry.promise ? `<span style="color:var(--amber)"><i></i>Promessa mensal</span>` : ""}</div>
+      <h3>Etiquetas pagas por semana (últimas ${carrier.weekly.length} semanas, domingo a sábado)</h3>
+      ${weeklyChart(carrier)}
+      <div class="legend"><span><b style="background:${COLORS[carrier.code]}"></b>Semana</span><span><b style="background:${COLORS[carrier.code]};opacity:.35"></b>Semana incompleta</span><span style="color:var(--amber)"><i style="border-top-style:solid"></i>Meta semanal</span><span style="color:var(--red)"><i></i>Próxima meta</span></div>
+      <h3>Últimos meses</h3>
+      ${monthTable(carrier, month)}
+    </article>`;
+  }
+
+  function quality(report) {
+    return `<section class="panel"><h2>Qualidade dos dados</h2>
+      <p class="note">Pontos encontrados ao ler a planilha. Vale corrigir na fonte antes de usar os números em decisões.</p>
+      <ul class="quality">${report.quality_notes.map((note) => `<li>${note}</li>`).join("")}</ul></section>`;
+  }
+
+  function footer(report) {
+    const sources = report.sources.map((s) => `<a href="${s.url}" target="_blank" rel="noopener">${s.name}</a>`).join(" · ");
+    return `<footer>Gerado em ${new Date(report.generated_at).toLocaleString("pt-BR")} a partir de ${report.source_file}. ${Object.values(report.definitions).join(" ")}<br/>Fontes originais: ${sources}</footer>`;
+  }
+
+  function render(report, month) {
+    if (!report.carriers || !report.carriers.length) return `<section class="state"><h2>Sem transportadoras na planilha</h2></section>`;
+    return `${header(report, month)}${totals(report, month)}${comparison(report, month)}${evolution(report)}
+      <section class="cols">${report.carriers.map((carrier) => card(carrier, month)).join("")}</section>
+      ${quality(report)}${footer(report)}`;
+  }
+
+  /* Keeps ``?month=`` in the address bar. Browsers may refuse this on file:// pages; the dashboard works without it. */
+  function rememberMonth(month) {
+    try {
+      const url = new URL(window.location.href);
+      url.searchParams.set("month", month);
+      window.history.replaceState(null, "", url);
+    } catch (error) {
+      /* opened from disk: deep links are unavailable, nothing else changes */
+    }
+  }
+
+  function mount(month) {
+    const app = document.querySelector("#app");
+    try {
+      app.innerHTML = render(window.VOLUME || {}, month);
+      const select = app.querySelector("#month");
+      if (select) select.addEventListener("change", (event) => mount(event.target.value));
+      rememberMonth(month);
+    } catch (error) {
+      app.innerHTML = `<section class="state"><h2>Não foi possível montar a visualização</h2><p>${error.message}</p></section>`;
+    }
+  }
+
+  /* ``?month=AAAA-MM`` deep-links a month; anything unknown falls back to the latest one. */
+  function initialMonth(report) {
+    const requested = new URLSearchParams(window.location.search).get("month");
+    return (report.months || []).includes(requested) ? requested : report.focus_month;
+  }
+
+  mount(initialMonth(window.VOLUME || {}));
+})();
+
+</script>
 </body>
 </html>
